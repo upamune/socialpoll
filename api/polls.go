@@ -1,7 +1,6 @@
 package main
 
 import (
-	"errors"
 	"net/http"
 
 	"gopkg.in/mgo.v2"
@@ -25,6 +24,10 @@ func handlePolls(w http.ResponseWriter, r *http.Request) {
 		return
 	case "DELETE":
 		handlePollsDelete(w, r)
+		return
+	case "OPTIONS":
+		w.Header().Add("Access-Control-Allow-Methods", "DELETE")
+		respond(w, r, http.StatusOK, nil)
 		return
 	}
 	respondHTTPErr(w, r, http.StatusNotFound)
@@ -51,9 +54,33 @@ func handlePollsGet(w http.ResponseWriter, r *http.Request) {
 }
 
 func handlePollsPost(w http.ResponseWriter, r *http.Request) {
-	respondErr(w, r, http.StatusInternalServerError, errors.New("未実装です"))
+	db := GetVar(r, "db").(*mgo.Database)
+	c := db.C("polls")
+	var p poll
+	if err := decodeBody(r, &p); err != nil {
+		respondErr(w, r, http.StatusBadRequest, "リクエストから調査項目を読み込めません", err)
+		return
+	}
+	p.ID = bson.NewObjectId()
+	if err := c.Insert(p); err != nil {
+		respondErr(w, r, http.StatusInternalServerError, "調査項目の格納に失敗しました", err)
+		return
+	}
+	w.Header().Set("Location", "polls/"+p.ID.Hex())
+	respond(w, r, http.StatusCreated, nil)
 }
 
 func handlePollsDelete(w http.ResponseWriter, r *http.Request) {
-	respondErr(w, r, http.StatusInternalServerError, errors.New("未実装です"))
+	db := GetVar(r, "db").(*mgo.Database)
+	c := db.C("polls")
+	p := NewPath(r.URL.Path)
+	if !p.HasID() {
+		respondErr(w, r, http.StatusMethodNotAllowed, "すべての調査項目を削除することはできません")
+		return
+	}
+	if err := c.RemoveId(bson.ObjectIdHex(p.ID)); err != nil {
+		respondErr(w, r, http.StatusInternalServerError, "調査項目の削除に失敗しました", err)
+		return
+	}
+	respond(w, r, http.StatusOK, nil)
 }
