@@ -1,0 +1,7 @@
+env.sh
+db
+nsq*
+*.tmp
+*.dat
+twittervotes/twittervotes
+counter/counter
