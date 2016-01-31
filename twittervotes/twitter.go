@@ -15,6 +15,8 @@ import (
 
 	"github.com/garyburd/go-oauth/oauth"
 	"github.com/joeshaw/envdecode"
+	"golang.org/x/net/context"
+	"bytes"
 )
 
 var conn net.Conn
@@ -72,81 +74,100 @@ func setupTwitterAuth() {
 	}
 }
 
-func makeRequest(req *http.Request, params url.Values) (*http.Response, error) {
+func makeRequest(query url.Values) (*http.Request, error) {
 	authSetupOnce.Do(func() {
 		setupTwitterAuth()
-		httpClient = &http.Client{
-			Transport: &http.Transport{
-				Dial: dial,
-			},
-		}
 	})
-	formEnc := params.Encode()
+	const endpoint = "https://stream.twitter.com/1.1/statuses/filter.json"
+
+	req, err := http.NewRequest("POST", endpoint, strings.NewReader(query.Encode()))
+	if err != nil {
+		return nil, err
+	}
+
+	formEnc := query.Encode()
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.Header.Set("Content-Length", strconv.Itoa(len(formEnc)))
-	req.Header.Set("Authorization", authClient.AuthorizationHeader(creds, "POST", req.URL, params))
+	ah := authClient.AuthorizationHeader(creds, "POST", req.URL, query)
+	req.Header.Set("Authorization", ah)
 
-	return httpClient.Do(req)
+	return req, nil
 }
 
-func readFromTwitter(votes chan<- string) {
+func readFromTwitter(ctx context.Context, votes chan<- string) {
 	options, err := loadOptions()
 	if err != nil {
 		log.Println("選択肢の読み込みに失敗しました:", err)
 		return
 	}
-	u, err := url.Parse("https://stream.twitter.com/1.1/statuses/filter.json")
-	if err != nil {
-		log.Println("URLの解析に失敗しました:", err)
-		return
-	}
+
 	query := make(url.Values)
 	query.Set("track", strings.Join(options, ","))
-	req, err := http.NewRequest("POST", u.String(), strings.NewReader(query.Encode()))
+	req, err := makeRequest(query)
 	if err != nil {
 		log.Println("検索のリクエストの作成に失敗しました:", err)
 		return
 	}
-	resp, err := makeRequest(req, query)
+	client := &http.Client{}
+	if deadline, ok := ctx.Deadline(); ok {
+		client.Timeout = deadline.Sub(time.Now())
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		log.Println("検索のリクエストに失敗しました", err)
 		return
 	}
-	reader = resp.Body
-	decoder := json.NewDecoder(reader)
+	done := make(chan struct{})
+	defer  func() { <- done } ()
+	defer resp.Body.Close()
 
-	for {
-		var tweet tweet
-		if err := decoder.Decode(&tweet); err != nil {
-			break
-		}
-		for _, option := range options {
-			if strings.Contains(strings.ToLower(tweet.Text), strings.ToLower(option)) {
-				log.Println("投票:", option)
-				votes <- option
-			}
-		}
-	}
-}
-
-func startTwitterStream(stopchan <-chan struct{}, votes chan<- string) <-chan struct{} {
-	stoppedchan := make(chan struct{}, 1)
 	go func() {
-		defer func() {
-			stoppedchan <- struct{}{}
-		}()
+		defer close(done)
+		log.Println("resp:", resp.StatusCode)
+		if resp.StatusCode != 200 {
+			var buf bytes.Buffer
+			io.Copy(&buf, resp.Body)
+			log.Println("resp body: %s", buf.String())
+			return
+		}
+		decoder := json.NewDecoder(resp.Body)
+
 		for {
-			select {
-			case <-stopchan:
-				log.Println("Twitterへ問い合わせを終了します...")
-				return
-			default:
-				log.Println("Twitterに問い合わせます")
-				readFromTwitter(votes)
-				log.Println("(待機中)")
-				time.Sleep(10 * time.Second)
+			var tweet tweet
+			if err := decoder.Decode(&tweet); err != nil {
+				break
+			}
+			for _, option := range options {
+				if strings.Contains(strings.ToLower(tweet.Text), strings.ToLower(option)) {
+					log.Println("投票:", option)
+					votes <- option
+				}
 			}
 		}
 	}()
-	return stoppedchan
+	select {
+	case <-ctx.Done():
+	case <-done:
+	}
+}
+
+func readFromTwitterWithTimeout(ctx context.Context, timeout time.Duration, votes chan<- string) {
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	readFromTwitter(ctx, votes)
+}
+
+func twitterStream(ctx context.Context, votes chan<- string) {
+	defer close(votes)
+	for {
+		log.Println("Twitterに問い合わせます...")
+		readFromTwitterWithTimeout(ctx, 1*time.Minute, votes)
+		log.Println("(待機中)")
+		select {
+		case <- ctx.Done():
+			log.Println("Twitterへの問い合わせを終了します...")
+			return
+		case <- time.After(10 * time.Second):
+		}
+	}
 }

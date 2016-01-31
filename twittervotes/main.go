@@ -3,11 +3,10 @@ package main
 import (
 	"log"
 	"os"
-	"sync"
-	"time"
 
 	"os/signal"
 	"syscall"
+	"golang.org/x/net/context"
 
 	"github.com/bitly/go-nsq"
 	"gopkg.in/mgo.v2"
@@ -42,57 +41,32 @@ func closedb() {
 	log.Println("データベース接続が閉じられました")
 }
 
-func publishVotes(votes <-chan string) <-chan struct{} {
-	stopchan := make(chan struct{}, 1)
+func publishVotes(votes <-chan string)  {
 	pub, _ := nsq.NewProducer("localhost:4150", nsq.NewConfig())
-	go func() {
-		for vote := range votes {
-			pub.Publish("votes", []byte(vote))
-		}
-		log.Println("Publisher: 停止中です")
-		pub.Stop()
-		log.Println("Publisher: 停止しました")
-		stopchan <- struct{}{}
-	}()
-	return stopchan
+	for vote := range votes {
+		pub.Publish("votes", []byte(vote))
+	}
+	log.Println("Publisher: 停止中です")
+	pub.Stop()
+	log.Println("Publisher: 停止しました")
 }
 
 func main() {
-	var stoplock sync.Mutex
-	stop := false
-	stopChan := make(chan struct{}, 1)
+	ctx, cancel := context.WithCancel(context.Background())
 	signalChan := make(chan os.Signal, 1)
 	go func() {
 		<-signalChan
-		stoplock.Lock()
-		stop = true
-		stoplock.Unlock()
+		cancel()
 		log.Println("停止します...")
-		stopChan <- struct{}{}
-		closeConn()
 	}()
 	signal.Notify(signalChan, syscall.SIGINT, syscall.SIGTERM)
+
 	if err := dialdb(); err != nil {
 		log.Fatalln("MongoDBへのダイアルに失敗しました: ", err)
 	}
 	defer closedb()
 
 	votes := make(chan string)
-	publisherStoppedChan := publishVotes(votes)
-	twitterStoppedChan := startTwitterStream(stopChan, votes)
-	go func() {
-		for {
-			time.Sleep(1 * time.Minute)
-			closeConn()
-			stoplock.Lock()
-			if stop {
-				stoplock.Lock()
-				break
-			}
-			stoplock.Unlock()
-		}
-	}()
-	<-twitterStoppedChan
-	close(votes)
-	<-publisherStoppedChan
+	go twitterStream(ctx, votes)
+	publishVotes(votes)
 }
